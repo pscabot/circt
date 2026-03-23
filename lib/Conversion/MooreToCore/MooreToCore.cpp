@@ -2022,6 +2022,52 @@ struct CallOpConversion : public OpConversionPattern<func::CallOp> {
   }
 };
 
+struct FuncDPICallOpConversion
+    : public OpConversionPattern<moore::FuncDPICallOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(moore::FuncDPICallOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> convResTypes;
+    if (typeConverter->convertTypes(op.getResultTypes(), convResTypes).failed())
+      return failure();
+    rewriter.replaceOpWithNewOp<sim::DPICallOp>(
+        op, convResTypes, op.getCalleeAttr(), /*clock=*/Value(),
+        /*enable=*/Value(), adaptor.getInputs());
+    return success();
+  }
+};
+
+struct DPIFuncOpConversion : public OpConversionPattern<moore::DPIFuncOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(moore::DPIFuncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto mooreDPIFuncType = op.getDPIFunctionType();
+
+    SmallVector<sim::DPIArgument> dpiArguments;
+    for (auto &arg : mooreDPIFuncType.getArguments()) {
+      Type coreType = typeConverter->convertType(arg.type);
+      if (!coreType)
+        return op.emitOpError("argument '")
+               << arg.name << "' has unsupported type " << arg.type;
+      dpiArguments.push_back({arg.name, coreType, arg.dir});
+    }
+
+    auto coreDPIFuncType =
+        sim::DPIFunctionType::get(rewriter.getContext(), dpiArguments);
+    auto simFunc = sim::DPIFuncOp::create(
+        rewriter, op.getLoc(), op.getSymNameAttr(), coreDPIFuncType,
+        op.getArgumentLocsAttr(), op.getVerilogNameAttr());
+    SymbolTable::setSymbolVisibility(simFunc,
+                                     SymbolTable::getSymbolVisibility(op));
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct UnrealizedConversionCastConversion
     : public OpConversionPattern<UnrealizedConversionCastOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3277,6 +3323,8 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     HWInstanceOpConversion,
     ReturnOpConversion,
     CallOpConversion,
+    DPIFuncOpConversion,
+    FuncDPICallOpConversion,
     UnrealizedConversionCastConversion,
     InPlaceOpConversion<debug::ArrayOp>,
     InPlaceOpConversion<debug::StructOp>,

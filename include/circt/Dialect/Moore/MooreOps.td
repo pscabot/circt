@@ -3359,6 +3359,108 @@ def VTableEntryOp : MooreOp<"vtable_entry", [
   }];
 }
 
+def DPIFuncOp : MooreOp<"func.dpi",
+  [IsolatedFromAbove, Symbol, OpAsmOpInterface]> {
+  let summary = "A DPI-imported SystemVerilog function declaration";
+  let description = [{
+    `moore.func.dpi` models a DPI-imported function declaration in Moore IR.
+    It stores a `sim::DPIFunctionType` with first-class port direction keywords
+    (`in`, `out`, `inout`, `return`, `ref`) so that MooreToCore can
+    lower it directly to `sim.func.dpi`.
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttr:$module_type,
+    OptionalAttr<LocationArrayAttr>:$argument_locs,
+    OptionalAttr<StrAttr>:$verilogName,
+    OptionalAttr<StrAttr>:$sym_visibility
+  );
+  let regions = (region AnyRegion:$body);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  let builders = [
+    OpBuilder<(ins
+      "StringAttr":$sym_name,
+      "sim::DPIFunctionType":$functionType,
+      "ArrayAttr":$argumentLocs,
+      "StringAttr":$verilogName
+    )>
+  ];
+
+  let extraClassDeclaration = [{
+    sim::DPIFunctionType getDPIFunctionType() {
+      return llvm::cast<sim::DPIFunctionType>(getModuleType());
+    }
+
+    mlir::FunctionType getFunctionType() {
+      return getDPIFunctionType().getFunctionType();
+    }
+
+    ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
+    ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
+
+    ::mlir::Region *getCallableRegion() { return nullptr; }
+
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// DPI Call
+//===----------------------------------------------------------------------===//
+
+def FuncDPICallOp : MooreOp<"func.dpi.call", [
+  CallOpInterface,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>
+]> {
+  let summary = "Call a DPI-imported function";
+  let description = [{
+    `moore.func.dpi.call` represents a call to a DPI-C imported function,
+    preserving the DPI intent from ImportVerilog so that downstream
+    MooreToCore lowering emits `sim.func.dpi.call` instead of a plain
+    `func.call`.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$callee,
+                       Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>);
+
+  let assemblyFormat = [{
+    $callee `(` $inputs `)` attr-dict `:` functional-type($inputs, results)
+  }];
+
+  let extraClassDeclaration = [{
+    operand_range getArgOperands() {
+      return getInputs();
+    }
+    MutableOperandRange getArgOperandsMutable() {
+      return getInputsMutable();
+    }
+    mlir::CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<mlir::SymbolRefAttr>("callee");
+    }
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr(getCalleeAttrName(),
+                       llvm::cast<mlir::SymbolRefAttr>(callee));
+    }
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
+
+}
+
 
 //===----------------------------------------------------------------------===//
 // String Builtins

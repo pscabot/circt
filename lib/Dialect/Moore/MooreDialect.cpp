@@ -12,6 +12,7 @@
 
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/Moore/MooreOps.h"
+#include "circt/Dialect/Sim/SimDialect.h"
 
 using namespace circt;
 using namespace circt::moore;

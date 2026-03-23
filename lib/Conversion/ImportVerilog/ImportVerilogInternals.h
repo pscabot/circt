@@ -24,6 +24,7 @@
 #include "llvm/Support/Debug.h"
 #include <map>
 #include <queue>
+#include <variant>
 
 #define DEBUG_TYPE "import-verilog"
 
@@ -92,19 +93,108 @@ struct ModuleLowering {
       portsBySyntaxNode;
 };
 
-/// Function lowering information. The `op` field holds either a `func::FuncOp`
-/// (for SystemVerilog functions) or a `moore::CoroutineOp` (for tasks),
-/// accessed through the `FunctionOpInterface`.
+/// Function lowering information. Holds exactly one of:
+/// - `mlir::FunctionOpInterface` for regular functions (`func::FuncOp`) and
+///   tasks (`moore::CoroutineOp`)
+/// - `moore::DPIFuncOp` for DPI-imported function declarations
+///
+/// Use `isDPI()`, `getFuncOp()`, `getDPIFuncOp()` to query/access the
+/// underlying operation.
 struct FunctionLowering {
-  mlir::FunctionOpInterface op;
-
   /// The AST symbols captured by this function, determined by the capture
   /// analysis pre-pass. These are added as extra parameters to the function
   /// during declaration.
   SmallVector<const slang::ast::ValueSymbol *, 4> capturedSymbols;
 
+  //===------------------------------------------------------------------===//
+  // Constructors — enforce one-of invariant
+  //===------------------------------------------------------------------===//
+
+  /// Construct from a regular function or coroutine op.
+  static std::unique_ptr<FunctionLowering>
+  create(mlir::FunctionOpInterface funcOp) {
+    auto l = std::make_unique<FunctionLowering>();
+    l->opVariant = funcOp;
+    return l;
+  }
+
+  /// Construct from a DPI-imported function declaration.
+  static std::unique_ptr<FunctionLowering> create(moore::DPIFuncOp dpiFunc) {
+    auto l = std::make_unique<FunctionLowering>();
+    l->opVariant = dpiFunc;
+    return l;
+  }
+
+  //===------------------------------------------------------------------===//
+  // Queries
+  //===------------------------------------------------------------------===//
+
+  /// Whether this represents a DPI-imported function.
+  bool isDPI() const {
+    return std::holds_alternative<moore::DPIFuncOp>(opVariant);
+  }
+
   /// Whether this is a coroutine (task) or a regular function.
-  bool isCoroutine() { return isa<moore::CoroutineOp>(op.getOperation()); }
+  bool isCoroutine() const {
+    if (auto funcIf = getFuncOp())
+      return isa<moore::CoroutineOp>(funcIf.getOperation());
+    return false;
+  }
+
+  //===------------------------------------------------------------------===//
+  // Accessors — return the specific op, null/assert if wrong kind
+  //===------------------------------------------------------------------===//
+
+  /// Get the FunctionOpInterface op (func::FuncOp or CoroutineOp).
+  /// Returns null if this is a DPI lowering.
+  mlir::FunctionOpInterface getFuncOp() const {
+    if (auto *f = std::get_if<mlir::FunctionOpInterface>(&opVariant))
+      return *f;
+    return {};
+  }
+
+  /// Get the DPIFuncOp. Returns null if this is a regular function.
+  moore::DPIFuncOp getDPIFuncOp() const {
+    if (auto *d = std::get_if<moore::DPIFuncOp>(&opVariant))
+      return *d;
+    return {};
+  }
+
+  /// Get the underlying MLIR operation, regardless of kind.
+  Operation *getOperation() const {
+    if (auto f = getFuncOp())
+      return f.getOperation();
+    if (auto d = getDPIFuncOp())
+      return d.getOperation();
+    return nullptr;
+  }
+
+  //===------------------------------------------------------------------===//
+  // Uniform helpers (work for all op kinds)
+  //===------------------------------------------------------------------===//
+
+  StringAttr getSymNameAttr() const {
+    if (auto d = getDPIFuncOp())
+      return d.getSymNameAttr();
+    return getFuncOp().getNameAttr();
+  }
+
+  StringRef getSymName() const { return getSymNameAttr().getValue(); }
+
+  Location getLoc() const { return getOperation()->getLoc(); }
+
+  FunctionType getFunctionType() const {
+    if (auto d = getDPIFuncOp())
+      return d.getFunctionType();
+    return cast<FunctionType>(getFuncOp().getFunctionType());
+  }
+
+  InFlightDiagnostic emitError(const Twine &message = {}) {
+    return getOperation()->emitError(message);
+  }
+
+private:
+  std::variant<mlir::FunctionOpInterface, moore::DPIFuncOp> opVariant;
 };
 
 // Class lowering information.
