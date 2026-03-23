@@ -1930,6 +1930,51 @@ struct CallOpConversion : public OpConversionPattern<func::CallOp> {
   }
 };
 
+struct FuncDPICallOpConversion
+    : public OpConversionPattern<moore::FuncDPICallOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(moore::FuncDPICallOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> convResTypes;
+    if (typeConverter->convertTypes(op.getResultTypes(), convResTypes).failed())
+      return failure();
+    rewriter.replaceOpWithNewOp<sim::DPICallOp>(
+        op, convResTypes, op.getCalleeAttr(), /*clock=*/Value(),
+        /*enable=*/Value(), adaptor.getInputs());
+    return success();
+  }
+};
+
+struct DPIFuncOpConversion : public OpConversionPattern<moore::DPIFuncOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(moore::DPIFuncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto mooreModType = op.getDPIModuleType();
+
+    SmallVector<sim::DPIPort> dpiPorts;
+    for (auto &port : mooreModType.getPorts()) {
+      Type coreType = typeConverter->convertType(port.type);
+      if (!coreType)
+        return op.emitOpError("port '")
+               << port.name << "' has unsupported type " << port.type;
+      dpiPorts.push_back({port.name, coreType, port.dir});
+    }
+
+    auto dpiModType = sim::DPIModuleType::get(rewriter.getContext(), dpiPorts);
+    auto simFunc = sim::DPIFuncOp::create(
+        rewriter, op.getLoc(), op.getSymNameAttr(), dpiModType,
+        op.getArgumentLocsAttr(), op.getVerilogNameAttr());
+    SymbolTable::setSymbolVisibility(simFunc,
+                                     SymbolTable::getSymbolVisibility(op));
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct UnrealizedConversionCastConversion
     : public OpConversionPattern<UnrealizedConversionCastOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3137,6 +3182,8 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     HWInstanceOpConversion,
     ReturnOpConversion,
     CallOpConversion,
+    DPIFuncOpConversion,
+    FuncDPICallOpConversion,
     UnrealizedConversionCastConversion,
     InPlaceOpConversion<debug::ArrayOp>,
     InPlaceOpConversion<debug::StructOp>,

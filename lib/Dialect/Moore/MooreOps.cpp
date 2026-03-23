@@ -14,8 +14,12 @@
 #include "circt/Dialect/HW/CustomDirectiveImpl.h"
 #include "circt/Dialect/HW/ModuleImplementation.h"
 #include "circt/Dialect/Moore/MooreAttributes.h"
+#include "circt/Dialect/Sim/SimOps.h"
+#include "circt/Dialect/Sim/SimTypes.h"
 #include "circt/Support/CustomDirectiveImpl.h"
+#include "circt/Support/ParsingUtils.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -24,6 +28,106 @@
 using namespace circt;
 using namespace circt::moore;
 using namespace mlir;
+
+static ParseResult parseMooreDirection(OpAsmParser &parser,
+                                       hw::ModulePort::Direction &dir) {
+  StringRef keyword;
+  if (failed(parser.parseKeyword(&keyword)))
+    return parser.emitError(parser.getCurrentLocation(),
+                            "expected port direction");
+  if (keyword == "in")
+    dir = hw::ModulePort::Direction::Input;
+  else if (keyword == "out")
+    dir = hw::ModulePort::Direction::Output;
+  else if (keyword == "inout")
+    dir = hw::ModulePort::Direction::InOut;
+  else
+    return parser.emitError(parser.getCurrentLocation(),
+                            "unknown port direction '")
+           << keyword << "'";
+  return success();
+}
+
+static ParseResult parseOptionalKeywordOrString(OpAsmParser &parser,
+                                                std::string &result,
+                                                bool &found) {
+  StringRef keyword;
+  if (succeeded(parser.parseOptionalKeyword(&keyword))) {
+    result = keyword.str();
+    found = true;
+    return success();
+  }
+  if (succeeded(parser.parseOptionalString(&result)))
+    found = true;
+  return success();
+}
+
+static ParseResult parseMooreDPIPort(OpAsmParser &parser,
+                                     hw::module_like_impl::PortParse &result) {
+  if (parseMooreDirection(parser, result.direction))
+    return failure();
+
+  if (result.direction == hw::ModulePort::Direction::Output) {
+    auto irLoc = parser.getCurrentLocation();
+    if (parser.parseKeywordOrString(&result.rawName) ||
+        parser.parseColonType(result.type))
+      return failure();
+
+    NamedAttrList attrs;
+    if (failed(parser.parseOptionalAttrDict(attrs)))
+      return failure();
+    result.attrs = attrs.getDictionary(parser.getContext());
+
+    std::optional<Location> maybeLoc;
+    if (failed(parser.parseOptionalLocationSpecifier(maybeLoc)))
+      return failure();
+    result.sourceLoc = maybeLoc ? *maybeLoc : parser.getEncodedSourceLoc(irLoc);
+    return success();
+  }
+
+  if (parser.parseOperand(result.ssaName, /*allowResultNumber=*/false))
+    return failure();
+
+  bool foundName = false;
+  if (parseOptionalKeywordOrString(parser, result.rawName, foundName) ||
+      parser.parseColonType(result.type))
+    return failure();
+  if (!foundName)
+    result.rawName =
+        parsing_util::getNameFromSSA(parser.getContext(), result.ssaName.name)
+            .str();
+
+  NamedAttrList attrs;
+  if (failed(parser.parseOptionalAttrDict(attrs)) ||
+      failed(parser.parseOptionalLocationSpecifier(result.sourceLoc)))
+    return failure();
+  result.attrs = attrs.getDictionary(parser.getContext());
+  return success();
+}
+
+static ParseResult
+parseMooreDPIPortList(OpAsmParser &parser,
+                      SmallVectorImpl<hw::module_like_impl::PortParse> &ports,
+                      TypeAttr &modType) {
+  auto *context = parser.getContext();
+  auto parseOnePort = [&]() -> ParseResult {
+    return parseMooreDPIPort(parser, ports.emplace_back());
+  };
+  if (parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Paren,
+                                     parseOnePort, " in port list"))
+    return failure();
+
+  SmallVector<hw::ModulePort> modulePorts;
+  modulePorts.reserve(ports.size());
+  for (auto &port : ports) {
+    modulePorts.push_back(
+        {StringAttr::get(context, port.rawName), port.type, port.direction});
+    if (!port.sourceLoc)
+      port.sourceLoc = parser.getEncodedSourceLoc(port.ssaName.location);
+  }
+  modType = TypeAttr::get(hw::ModuleType::get(context, modulePorts));
+  return success();
+}
 
 //===----------------------------------------------------------------------===//
 // SVModuleOp
@@ -69,8 +173,7 @@ ParseResult SVModuleOp::parse(OpAsmParser &parser, OperationState &result) {
   // Parse the ports.
   SmallVector<hw::module_like_impl::PortParse> ports;
   TypeAttr modType;
-  if (failed(
-          hw::module_like_impl::parseModuleSignature(parser, ports, modType)))
+  if (failed(parseMooreDPIPortList(parser, ports, modType)))
     return failure();
   result.addAttribute(getModuleTypeAttrName(result.name), modType);
 
@@ -1808,6 +1911,167 @@ LogicalResult QueueConcatOp::verify() {
   }
 
   return success();
+}
+
+void DPIFuncOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                      StringAttr symName, sim::DPIModuleType moduleType,
+                      ArrayAttr argumentLocs, StringAttr verilogName) {
+  odsState.addAttribute(getSymNameAttrName(odsState.name), symName);
+  odsState.addAttribute(getModuleTypeAttrName(odsState.name),
+                        TypeAttr::get(moduleType));
+  if (argumentLocs)
+    odsState.addAttribute(getArgumentLocsAttrName(odsState.name), argumentLocs);
+  if (verilogName)
+    odsState.addAttribute(getVerilogNameAttrName(odsState.name), verilogName);
+  odsState.addRegion();
+}
+
+ParseResult DPIFuncOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto builder = parser.getBuilder();
+  auto ctx = builder.getContext();
+
+  (void)mlir::impl::parseOptionalVisibilityKeyword(parser, result.attributes);
+
+  StringAttr nameAttr;
+  if (parser.parseSymbolName(nameAttr, SymbolTable::getSymbolAttrName(),
+                             result.attributes))
+    return failure();
+
+  SmallVector<sim::DPIPort> ports;
+  SmallVector<Attribute> portLocs;
+  auto unknownLoc = builder.getUnknownLoc();
+  bool hasLocs = false;
+
+  auto parseOnePort = [&]() -> ParseResult {
+    StringRef dirKeyword;
+    auto keyLoc = parser.getCurrentLocation();
+    if (parser.parseKeyword(&dirKeyword))
+      return failure();
+    auto dir = sim::parseDPIDirectionKeyword(dirKeyword);
+    if (!dir)
+      return parser.emitError(keyLoc, "expected DPI port direction keyword");
+
+    // For input/inout/ref ports, parse SSA name; for output/return, bare name.
+    bool hasSSA = sim::isCallOperandDir(*dir);
+    std::string portName;
+    if (hasSSA) {
+      OpAsmParser::UnresolvedOperand ssaName;
+      if (parser.parseOperand(ssaName, /*allowResultNumber=*/false))
+        return failure();
+      portName = ssaName.name.substr(1).str();
+    } else {
+      if (parser.parseKeywordOrString(&portName))
+        return failure();
+    }
+
+    Type portType;
+    if (parser.parseColonType(portType))
+      return failure();
+    ports.push_back({StringAttr::get(ctx, portName), portType, *dir});
+
+    std::optional<Location> maybeLoc;
+    if (failed(parser.parseOptionalLocationSpecifier(maybeLoc)))
+      return failure();
+    if (maybeLoc) {
+      portLocs.push_back(*maybeLoc);
+      hasLocs = true;
+    } else {
+      portLocs.push_back(unknownLoc);
+    }
+    return success();
+  };
+
+  if (parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Paren,
+                                     parseOnePort, " in DPI port list"))
+    return failure();
+
+  auto modType = sim::DPIModuleType::get(ctx, ports);
+  result.addAttribute(DPIFuncOp::getModuleTypeAttrName(result.name),
+                      TypeAttr::get(modType));
+  if (hasLocs)
+    result.addAttribute(DPIFuncOp::getArgumentLocsAttrName(result.name),
+                        builder.getArrayAttr(portLocs));
+  result.addRegion();
+
+  if (failed(parser.parseOptionalAttrDictWithKeyword(result.attributes)))
+    return failure();
+  return success();
+}
+
+LogicalResult DPIFuncOp::verify() {
+  return getDPIModuleType().verify([&]() { return emitOpError(); });
+}
+
+void DPIFuncOp::print(OpAsmPrinter &p) {
+  p << ' ';
+
+  StringRef visibilityAttrName = SymbolTable::getVisibilityAttrName();
+  if (auto visibility = (*this)->getAttrOfType<StringAttr>(visibilityAttrName))
+    p << visibility.getValue() << ' ';
+  p.printSymbolName(getSymName());
+
+  auto modType = getDPIModuleType();
+  auto dpiPorts = modType.getPorts();
+
+  p << '(';
+  llvm::interleaveComma(llvm::enumerate(dpiPorts), p, [&](auto it) {
+    auto &port = it.value();
+    auto i = it.index();
+
+    p << sim::stringifyDPIDirectionKeyword(port.dir) << ' ';
+
+    if (sim::isCallOperandDir(port.dir))
+      p << '%';
+    p.printKeywordOrString(port.name.getValue());
+    p << " : ";
+    p.printType(port.type);
+
+    if (getArgumentLocs()) {
+      auto loc = cast<Location>(getArgumentLocsAttr()[i]);
+      if (loc != UnknownLoc::get(getContext()))
+        p.printOptionalLocationSpecifier(loc);
+    }
+  });
+  p << ')';
+
+  mlir::function_interface_impl::printFunctionAttributes(
+      p, *this,
+      {visibilityAttrName, getModuleTypeAttrName(), getArgumentLocsAttrName()});
+}
+
+LogicalResult
+FuncDPICallOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto referencedOp =
+      symbolTable.lookupNearestSymbolFrom(*this, getCalleeAttr());
+  if (!referencedOp)
+    return emitError("cannot find function declaration '")
+           << getCallee() << "'";
+  if (auto dpiFunc = dyn_cast<DPIFuncOp>(referencedOp)) {
+    auto funcType = dpiFunc.getFunctionType();
+    auto expectedInputs = funcType.getInputs();
+    auto expectedResults = funcType.getResults();
+    if (getInputs().size() != expectedInputs.size())
+      return emitError("expects ")
+             << expectedInputs.size() << " DPI operands, but got "
+             << getInputs().size();
+    if (getResults().size() != expectedResults.size())
+      return emitError("expects ")
+             << expectedResults.size() << " DPI results, but got "
+             << getResults().size();
+    for (auto [operand, expectedType] : llvm::zip(getInputs(), expectedInputs))
+      if (operand.getType() != expectedType)
+        return emitError("operand type mismatch: expected ")
+               << expectedType << ", but got " << operand.getType();
+    for (auto [result, expectedType] : llvm::zip(getResults(), expectedResults))
+      if (result.getType() != expectedType)
+        return emitError("result type mismatch: expected ")
+               << expectedType << ", but got " << result.getType();
+    return success();
+  }
+  if (isa<func::FuncOp>(referencedOp))
+    return success();
+  return emitError("callee must be 'moore.func.dpi' or 'func.func' but got '")
+         << referencedOp->getName() << "'";
 }
 
 //===----------------------------------------------------------------------===//
