@@ -30,6 +30,10 @@ def ProceduralizeSim : Pass<"sim-proceduralize", "hw::HWModuleOp"> {
 def LowerDPIFunc : Pass<"sim-lower-dpi-func", "mlir::ModuleOp"> {
   let summary = "Lower sim.dpi.func into func.func for the simulation flow";
   let dependentDialects = ["mlir::func::FuncDialect", "mlir::LLVM::LLVMDialect"];
+  let options = [
+    Option<"declarationsOnly", "declarations-only", "bool", "false",
+           "Only lower DPI function declarations without creating wrappers">
+  ];
 }
 
 #endif // CIRCT_DIALECT_SIM_SEQPASSES

@@ -59,6 +59,7 @@ struct LoweringState {
 };
 
 struct LowerDPIFuncPass : public sim::impl::LowerDPIFuncBase<LowerDPIFuncPass> {
+  using LowerDPIFuncBase::LowerDPIFuncBase;
 
   LogicalResult lowerDPI();
   LogicalResult lowerDPIFuncOp(sim::DPIFuncOp simFunc,
@@ -133,69 +134,76 @@ LogicalResult LowerDPIFuncPass::lowerDPIFuncOp(sim::DPIFuncOp simFunc,
     func.setPrivate();
   }
 
-  // Create a wrapper module that calls a DPI function.
-  auto wrapperFuncType = simFunc.getFunctionType();
-  auto funcOp = func::FuncOp::create(
-      builder,
-      loweringState.nameSpace.newName(simFunc.getSymName() + "_wrapper"),
-      wrapperFuncType);
+  if (!declarationsOnly) {
+    // Create a wrapper module that calls a DPI function.
+    auto wrapperFuncType = simFunc.getFunctionType();
+    auto funcOp = func::FuncOp::create(
+        builder,
+        loweringState.nameSpace.newName(simFunc.getSymName() + "_wrapper"),
+        wrapperFuncType);
 
-  // Map old symbol to a new func op.
-  loweringState.dpiFuncDeclMapping[simFunc.getSymNameAttr()] = funcOp;
+    // Map old symbol to a new func op.
+    loweringState.dpiFuncDeclMapping[simFunc.getSymNameAttr()] = funcOp;
 
-  builder.setInsertionPointToStart(funcOp.addEntryBlock());
-  SmallVector<Value> functionInputs;
-  SmallVector<std::pair<Type, Value>> wrapperOutputAllocas;
-  Value explicitReturnValue;
+    builder.setInsertionPointToStart(funcOp.addEntryBlock());
+    SmallVector<Value> functionInputs;
+    SmallVector<std::pair<Type, Value>> wrapperOutputAllocas;
+    Value explicitReturnValue;
 
-  size_t inputIndex = 0;
-  for (auto &port : dpiPorts) {
-    switch (port.dir) {
-    case sim::DPIDirection::Input:
-      functionInputs.push_back(funcOp.getArgument(inputIndex));
-      ++inputIndex;
-      break;
-    case sim::DPIDirection::Return:
-      break;
-    case sim::DPIDirection::Ref:
-      functionInputs.push_back(funcOp.getArgument(inputIndex));
-      ++inputIndex;
-      break;
-    case sim::DPIDirection::Output: {
-      auto one =
-          LLVM::ConstantOp::create(builder, builder.getI64IntegerAttr(1));
-      auto alloca = LLVM::AllocaOp::create(
-          builder, builder.getType<LLVM::LLVMPointerType>(), port.type, one);
-      functionInputs.push_back(alloca);
-      wrapperOutputAllocas.push_back({port.type, alloca});
-      break;
+    size_t inputIndex = 0;
+    for (auto &port : dpiPorts) {
+      switch (port.dir) {
+      case sim::DPIDirection::Input:
+        functionInputs.push_back(funcOp.getArgument(inputIndex));
+        ++inputIndex;
+        break;
+      case sim::DPIDirection::Return:
+        break;
+      case sim::DPIDirection::Ref:
+        functionInputs.push_back(funcOp.getArgument(inputIndex));
+        ++inputIndex;
+        break;
+      case sim::DPIDirection::Output: {
+        auto one =
+            LLVM::ConstantOp::create(builder, builder.getI64IntegerAttr(1));
+        auto alloca = LLVM::AllocaOp::create(
+            builder, builder.getType<LLVM::LLVMPointerType>(), port.type, one);
+        functionInputs.push_back(alloca);
+        wrapperOutputAllocas.push_back({port.type, alloca});
+        break;
+      }
+      case sim::DPIDirection::InOut: {
+        auto one =
+            LLVM::ConstantOp::create(builder, builder.getI64IntegerAttr(1));
+        auto alloca = LLVM::AllocaOp::create(
+            builder, builder.getType<LLVM::LLVMPointerType>(), port.type, one);
+        LLVM::StoreOp::create(builder, funcOp.getArgument(inputIndex), alloca);
+        ++inputIndex;
+        functionInputs.push_back(alloca);
+        wrapperOutputAllocas.push_back({port.type, alloca});
+        break;
+      }
+      }
     }
-    case sim::DPIDirection::InOut: {
-      auto one =
-          LLVM::ConstantOp::create(builder, builder.getI64IntegerAttr(1));
-      auto alloca = LLVM::AllocaOp::create(
-          builder, builder.getType<LLVM::LLVMPointerType>(), port.type, one);
-      LLVM::StoreOp::create(builder, funcOp.getArgument(inputIndex), alloca);
-      ++inputIndex;
-      functionInputs.push_back(alloca);
-      wrapperOutputAllocas.push_back({port.type, alloca});
-      break;
-    }
-    }
+
+    auto call = func::CallOp::create(builder, func, functionInputs);
+    if (explicitReturnType)
+      explicitReturnValue = call.getResult(0);
+
+    SmallVector<Value> results;
+    results.reserve(wrapperOutputAllocas.size() +
+                    (explicitReturnValue ? 1 : 0));
+    for (auto [type, alloca] : wrapperOutputAllocas)
+      results.push_back(LLVM::LoadOp::create(builder, type, alloca));
+    if (explicitReturnValue)
+      results.push_back(explicitReturnValue);
+
+    func::ReturnOp::create(builder, results);
+  } else {
+    // In declarations-only mode, map the old symbol to the C function
+    // declaration so that call sites get updated to reference it directly.
+    loweringState.dpiFuncDeclMapping[simFunc.getSymNameAttr()] = func;
   }
-
-  auto call = func::CallOp::create(builder, func, functionInputs);
-  if (explicitReturnType)
-    explicitReturnValue = call.getResult(0);
-
-  SmallVector<Value> results;
-  results.reserve(wrapperOutputAllocas.size() + (explicitReturnValue ? 1 : 0));
-  for (auto [type, alloca] : wrapperOutputAllocas)
-    results.push_back(LLVM::LoadOp::create(builder, type, alloca));
-  if (explicitReturnValue)
-    results.push_back(explicitReturnValue);
-
-  func::ReturnOp::create(builder, results);
 
   simFunc.erase();
   return success();
